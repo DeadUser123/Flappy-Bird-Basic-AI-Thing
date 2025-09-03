@@ -1,5 +1,5 @@
 # Kevin Xia — Basic Flappy Bird AI using DDQN stuff
-# got to like 230 ish before I quit because it was boring
+# gets to 517
 # does random stuff during training so scores are lower than during playback
 # uses prioritized experience replay because normal experience replay was too slow
 
@@ -15,6 +15,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 import pygame
 import os
+import asyncio
+import sys
+import io
 
 # le parameters
 SEED = 42 # the answer to life, the universe, and everything
@@ -138,7 +141,7 @@ class FlappyBirdEnv: # simulate flappy bird (was too lazy to find one to pull of
         reward = float(np.clip(reward, -20.0, 20.0))
         return self.get_state(), reward, done, {}
 
-class DQNNet(nn.Module): # normal dqn
+class MLP(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, 256)
@@ -213,8 +216,8 @@ class PrioritizedReplay: # because it wasn't learning fast enough
 # double dqn agent because single dqn kept dying
 class Agent:
     def __init__(self, state_dim, action_dim):
-        self.q = DQNNet(state_dim, action_dim).to(DEVICE)
-        self.target = DQNNet(state_dim, action_dim).to(DEVICE)
+        self.q = MLP(state_dim, action_dim).to(DEVICE)
+        self.target = MLP(state_dim, action_dim).to(DEVICE)
         self.target.load_state_dict(self.q.state_dict())
         self.opt = optim.Adam(self.q.parameters(), lr=LR)
         self.replay = PrioritizedReplay(BUFFER_SIZE, alpha=PRIOR_ALPHA)
@@ -282,6 +285,33 @@ def save_checkpoint(agent, episode, path=SAVE_DIR): # saves the agent so can use
     }, fname)
     print(f"Saved checkpoint: {fname}")
 
+def load_checkpoint(agent, path):
+    checkpoint = torch.load(path, map_location=DEVICE)
+    agent.q.load_state_dict(checkpoint['q_state_dict'])
+    agent.target.load_state_dict(checkpoint['target_state_dict'])
+    agent.opt.load_state_dict(checkpoint['opt_state_dict'])
+    agent.step_count = checkpoint['step_count']
+    agent.epsilon = checkpoint['epsilon']
+    print(f"Loaded checkpoint from {path}")
+    return agent
+
+def load_model(agent, filename="model.pth"):
+    if sys.platform == "emscripten":  # browser
+        with pygame.asset.open(filename, "rb") as f:
+            buffer = io.BytesIO(f.read())
+            checkpoint = torch.load(buffer, map_location="cpu")
+    else:
+        checkpoint = torch.load(filename, map_location="cpu")
+
+    if "q_state_dict" in checkpoint:
+        agent.q.load_state_dict(checkpoint["q_state_dict"])
+    else:
+        agent.q.load_state_dict(checkpoint) 
+
+    print("Model loaded successfully")
+    return agent
+
+
 def train(episodes=2000, checkpoint_every=500): # 2000 was an arbitrary choice, 1500 is probably enough haven't tried though
     env = FlappyBirdEnv()
     agent = Agent(env.state_size, env.action_size)
@@ -327,7 +357,7 @@ def train(episodes=2000, checkpoint_every=500): # 2000 was an arbitrary choice, 
     return agent
 
 # runs the game using the trained agent
-def play_game(agent, speed=30, episodes=5):
+async def play_game(agent, speed=30, episodes=5):
     pygame.init()
     screen = pygame.display.set_mode((400, 500))
     clock = pygame.time.Clock()
@@ -341,6 +371,7 @@ def play_game(agent, speed=30, episodes=5):
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
+                    sys.exit()
                     return
             action = agent.act(state, eval_mode=True) # no more random actions = higher scores than training
             state, _, done, _ = env.step(action)
@@ -353,8 +384,28 @@ def play_game(agent, speed=30, episodes=5):
             screen.blit(score_text, (10,10))
             pygame.display.flip()
             clock.tick(speed)
+            await asyncio.sleep(0)
+    print(env.score)
     pygame.quit()
 
 # actually run it for real
-agent = train(episodes=2000, checkpoint_every=500)
-play_game(agent, speed=30, episodes=5)
+async def main():
+    env = FlappyBirdEnv()
+    agent = Agent(env.state_size, env.action_size)
+
+    checkpoint_path = "checkpoints/dqn_ep2000.pth"
+    if os.path.exists(checkpoint_path) or sys.platform == "emscripten":
+        agent = load_model(agent, checkpoint_path)
+        await play_game(agent, speed=60, episodes=1)
+        sys.exit(0)
+    else:
+        print("No checkpoint found, starting training of 2000 episodes")
+        agent = await train(episodes=2000, checkpoint_every=500)
+        await play_game(agent, speed=60, episodes=1)
+        sys.exit(0)
+
+    # keep browser event loop alive
+    while True:
+        await asyncio.sleep(1)
+
+asyncio.run(main()) # suggestion made to make it runnable with pybag
