@@ -141,7 +141,7 @@ class FlappyBirdEnv: # simulate flappy bird (was too lazy to find one to pull of
         reward = float(np.clip(reward, -20.0, 20.0))
         return self.get_state(), reward, done, {}
 
-class MLP(nn.Module):
+class NetworkThing(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, 256)
@@ -216,8 +216,8 @@ class PrioritizedReplay: # because it wasn't learning fast enough
 # double dqn agent because single dqn kept dying
 class Agent:
     def __init__(self, state_dim, action_dim):
-        self.q = MLP(state_dim, action_dim).to(DEVICE)
-        self.target = MLP(state_dim, action_dim).to(DEVICE)
+        self.q = NetworkThing(state_dim, action_dim).to(DEVICE)
+        self.target = NetworkThing(state_dim, action_dim).to(DEVICE)
         self.target.load_state_dict(self.q.state_dict())
         self.opt = optim.Adam(self.q.parameters(), lr=LR)
         self.replay = PrioritizedReplay(BUFFER_SIZE, alpha=PRIOR_ALPHA)
@@ -312,15 +312,14 @@ def load_model(agent, filename="model.pth"):
     return agent
 
 
-def train(episodes=2000, checkpoint_every=500): # 2000 was an arbitrary choice, 1500 is probably enough haven't tried though
+def train(episodes=2000, checkpoint_every=500, starting_episode=0, agent=Agent(FlappyBirdEnv().state_size, FlappyBirdEnv().action_size)): # 2000 was an arbitrary choice, 1500 is probably enough haven't tried though
     env = FlappyBirdEnv()
-    agent = Agent(env.state_size, env.action_size)
     with open(LOG_CSV, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['episode','reward','score','steps','epsilon','loss'])
 
     total_steps = 0
-    for ep in range(1, episodes+1):
+    for ep in range(1 + starting_episode, episodes+1 + starting_episode):
         env = FlappyBirdEnv(ep)
         state = env.reset()
         done = False
@@ -353,11 +352,11 @@ def train(episodes=2000, checkpoint_every=500): # 2000 was an arbitrary choice, 
         if ep % checkpoint_every == 0:
             save_checkpoint(agent, ep)
 
-    save_checkpoint(agent, episodes)
+    save_checkpoint(agent, episodes + starting_episode)
     return agent
 
 # runs the game using the trained agent
-async def play_game(agent, speed=30, episodes=5):
+async def run_ai_demo(agent, speed=30, episodes=1):
     pygame.init()
     screen = pygame.display.set_mode((400, 500))
     clock = pygame.time.Clock()
@@ -388,24 +387,152 @@ async def play_game(agent, speed=30, episodes=5):
     print(env.score)
     pygame.quit()
 
+# Human vs AI mode
+async def run_human_vs_ai(agent, speed=30):
+    pygame.init()
+    screen = pygame.display.set_mode((400, 500))
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont("Arial", 24)
+    big_font = pygame.font.SysFont("Arial", 72, bold=True)
+
+    while True:  # loop for restart
+        env_ai = FlappyBirdEnv()
+        env_player = FlappyBirdEnv()
+        env_player.pipes = [p.copy() for p in env_ai.pipes]
+
+        state_ai = env_ai.reset()
+        state_player = env_player.reset()
+        env_player.pipes = [p.copy() for p in env_ai.pipes]
+
+        done_ai = False
+        done_player = False
+
+        # countdown
+        for count in range(10, 0, -1):
+            screen.fill((135, 206, 235))
+            text = big_font.render(str(count), True, (0, 0, 0))
+            rect = text.get_rect(center=(200, 200))
+            screen.blit(text, rect)
+
+            skip_text = font.render("Press SPACE to skip countdown", True, (50, 50, 50))
+            screen.blit(skip_text, skip_text.get_rect(center=(200, 300)))
+
+            pygame.display.flip()
+
+            skip = False
+            start_time = time.time()
+            while time.time() - start_time < 1:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        pygame.quit()
+                        sys.exit()
+                    if event.type == pygame.KEYDOWN and event.key in (pygame.K_SPACE, pygame.K_UP):
+                        skip = True
+                if skip:
+                    break
+                await asyncio.sleep(0)
+            if skip:
+                break
+
+        # main loop
+        while not done_ai: # don't need to inform player if AI died
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_q:
+                        pygame.quit()
+                        sys.exit()
+                    if event.key == pygame.K_r:
+                        # restart requested
+                        done_ai = True
+                        done_player = True
+                        break
+
+            # AI acts
+            if not done_ai:
+                action_ai = agent.act(state_ai, eval_mode=True)
+                state_ai, _, done_ai, _ = env_ai.step(action_ai)
+
+            # Human act
+            action_player = 0
+            keys = pygame.key.get_pressed()
+            if (keys[pygame.K_SPACE] or keys[pygame.K_UP]) and not done_player:
+                action_player = 1
+            state_player, _, done_player, _ = env_player.step(action_player)
+
+            # Sync pipes
+            env_player.pipes = [p.copy() for p in env_ai.pipes]
+
+            # draw everything
+            screen.fill((135, 206, 235))
+            for (pipe_x, pipe_y) in env_ai.pipes:
+                pygame.draw.rect(screen, (0, 180, 0), (pipe_x, 0, env_ai.pipe_width, pipe_y - env_ai.pipe_gap//2))
+                pygame.draw.rect(screen, (0, 180, 0), (pipe_x, pipe_y + env_ai.pipe_gap//2, env_ai.pipe_width, env_ai.screen_height - (pipe_y + env_ai.pipe_gap//2)))
+
+            # player bird
+            pygame.draw.circle(
+                screen, (255, 255, 0) if not done_player else (150, 150, 150),
+                (int(env_player.bird_x), int(env_player.bird_y)), env_player.bird_radius
+            )
+            # AI bird
+            pygame.draw.circle(
+                screen, (255, 0, 0) if not done_ai else (100, 100, 100),
+                (int(env_ai.bird_x), int(env_ai.bird_y)), env_ai.bird_radius
+            )
+
+            # Scores
+            score_text = font.render(f"AI Score: {env_ai.score}  Player Score: {env_player.score}", True, (0,0,0))
+            screen.blit(score_text, (10,10))
+
+            # If player died, show restart/quit instructions
+            if done_player:
+                notify_text = font.render("You died! Press R to Restart or Q to Quit", True, (200, 0, 0))
+                screen.blit(notify_text, (20, 470))  # bottom of screen
+
+            pygame.display.flip()
+            clock.tick(speed)
+            await asyncio.sleep(0)
+
 # actually run it for real
 async def main():
     env = FlappyBirdEnv()
     agent = Agent(env.state_size, env.action_size)
+    
+    train_mode = True if input("Train mode? (y/n): ").strip().lower() == 'y' else False
+    if not train_mode:
+        demo = True if input("Run demo? (y/n): ").strip().lower() == 'y' else False
 
     checkpoint_path = "checkpoints/dqn_ep2000.pth"
+    
+    if train_mode:
+        x = int(input("Enter checkpoint number to begin training from: ").lower().strip().replace("k", "000"))
+        y = int(input("Enter checkpoint number to end training: ").lower().strip().replace("k", "000"))
+        checkpoint_path = f"checkpoints/dqn_ep{x}.pth"
+        agent = load_model(agent, checkpoint_path)
+        agent = await train(episodes=y - x, checkpoint_every=500, starting_episode=x, agent=agent) # continue training from loaded model
+        run_ai_demo(agent, speed=60, episodes=1)
+        sys.exit(0)
+        return
+    
     if os.path.exists(checkpoint_path) or sys.platform == "emscripten":
         agent = load_model(agent, checkpoint_path)
-        await play_game(agent, speed=60, episodes=1)
+        if not demo:
+            print("Starting Human vs AI mode")
+            await run_human_vs_ai(agent, speed=60)
+        else:
+            print("Starting AI demo mode")
+            await run_ai_demo(agent, speed=60, episodes=1)
         sys.exit(0)
     else:
         print("No checkpoint found, starting training of 2000 episodes")
         agent = await train(episodes=2000, checkpoint_every=500)
-        await play_game(agent, speed=60, episodes=1)
+        await run_ai_demo(agent, speed=60, episodes=1)
         sys.exit(0)
 
     # keep browser event loop alive
     while True:
         await asyncio.sleep(1)
 
-asyncio.run(main()) # suggestion made to make it runnable with pybag
+asyncio.run(main()) # suggestion made to make it theoretically runnable with pygbag
